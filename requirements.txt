@@ -1,0 +1,4 @@
+gymnasium==1.2.2
+kymnasium==1.1.0
+numpy==2.3.5
+torch==2.5.1
