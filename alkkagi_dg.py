@@ -1,7 +1,9 @@
+import os
+os.environ['SDL_AUDIODRIVER'] = 'dummy'  # ALSA 경고 제거
+
 import gymnasium as gym
 import kymnasium as kym
 import numpy as np
-import os
 import glob
 import random
 import torch
@@ -163,6 +165,45 @@ def is_protected_by_wall(my_pos, enemy_positions, obstacles):
     return protected_count / len(enemy_positions)
 
 
+def calculate_wall_collision(stones, obstacles, radius=15.0):
+    """
+    돌이 벽과 충돌하는지 확인
+    stones: (N, 3) 배열 [x, y, alive]
+    obstacles: [[x, y, w, h], ...] 벽 리스트
+    radius: 돌의 반지름
+    반환: (N,) 불리언 배열 (충돌 여부)
+    """
+    if len(obstacles) == 0:
+        return np.zeros(len(stones), dtype=bool)
+
+    collisions = np.zeros(len(stones), dtype=bool)
+
+    for i, stone in enumerate(stones):
+        if stone[2] == 0:  # 죽은 돌은 무시
+            continue
+
+        sx, sy = stone[0], stone[1]
+
+        for obs in obstacles:
+            ox, oy, ow, oh = obs[0], obs[1], obs[2], obs[3]
+            # 벽 경계
+            left = ox - ow / 2
+            right = ox + ow / 2
+            top = oy - oh / 2
+            bottom = oy + oh / 2
+
+            # 돌 중심에서 벽까지 최단 거리
+            closest_x = np.clip(sx, left, right)
+            closest_y = np.clip(sy, top, bottom)
+            dist = np.sqrt((sx - closest_x) ** 2 + (sy - closest_y) ** 2)
+
+            if dist < radius:
+                collisions[i] = True
+                break
+
+    return collisions
+
+
 # ==========================================
 # 2. Neural Network (The Brain)
 # ==========================================
@@ -220,7 +261,7 @@ class BaseAgent(kym.Agent):
         super().__init__()
         self.my_turn = my_turn  # 0: Black, 1: White
         self.data = []
-        self.input_dim = 24  # 최적화된 관측 공간 (불필요 제거)
+        self.input_dim = 30  # 벽 정보 6차원 추가 (24 + 6)
         self.action_dim = 2
         self.model = SniperNet(self.input_dim, self.action_dim).to(DEVICE)
         self.optimizer = optim.Adam(self.model.parameters(), lr=LR_ACTOR)
@@ -265,11 +306,12 @@ class BaseAgent(kym.Agent):
     # [중요] 흑/백 구분 없이 '나'와 '적'으로 변환하여 인식
     def _process_obs(self, obs, override_turn=None, training=True):
         """
-        최적화된 관측 공간 (24차원 × 3돌)
+        확장된 관측 공간 (30차원 × 3돌) - 벽 정보 추가
         [0-5]   내 돌: 경계위험도, 위치x, 위치y, 적수, 내수, 벽거리
         [6-11]  적1: 생존, 거리, 경계근접도, 방향x, 방향y, 막힘여부
         [12-17] 적2: 생존, 거리, 경계근접도, 방향x, 방향y, 막힘여부
         [18-23] 적3: 생존, 거리, 경계근접도, 방향x, 방향y, 막힘여부
+        [24-29] 벽: 존재여부, 중심x, 중심y, 너비, 높이, 내돌→벽방향
         """
         batch_size = len(obs['black'])
 
@@ -285,7 +327,7 @@ class BaseAgent(kym.Agent):
 
         obstacles = obs.get('obstacles', None)
 
-        processed = np.zeros((batch_size, 3, 24), dtype=np.float32)
+        processed = np.zeros((batch_size, 3, 30), dtype=np.float32)
         alive_mask = np.zeros((batch_size, 3), dtype=np.float32)
 
         op_xy = op_stones[:, :, 0:2]
@@ -357,6 +399,31 @@ class BaseAgent(kym.Agent):
                         processed[b, i, base_idx + 3] = dir_x                 # 방향 x
                         processed[b, i, base_idx + 4] = dir_y                 # 방향 y
                         processed[b, i, base_idx + 5] = is_blocked            # 막힘 여부
+
+                # [24-29] 벽 정보 (6차원)
+                if len(batch_obstacles) > 0:
+                    # 가장 가까운 벽 선택
+                    wall_centers = np.array([[w[0], w[1]] for w in batch_obstacles])
+                    wall_dists = np.sqrt(np.sum((wall_centers - my_pos) ** 2, axis=1))
+                    nearest_idx = np.argmin(wall_dists)
+                    nearest_wall = batch_obstacles[nearest_idx]
+
+                    wall_x, wall_y = nearest_wall[0], nearest_wall[1]
+                    wall_w, wall_h = nearest_wall[2], nearest_wall[3]
+
+                    # 내 돌에서 벽 방향
+                    wall_diff = np.array([wall_x, wall_y]) - my_pos
+                    wall_norm = np.linalg.norm(wall_diff) + 1e-6
+                    wall_dir = wall_diff[0] / wall_norm  # x 방향만 (단순화)
+
+                    processed[b, i, 24] = 1.0                          # 벽 존재
+                    processed[b, i, 25] = wall_x / BOARD_SIZE          # 벽 중심 x
+                    processed[b, i, 26] = wall_y / BOARD_SIZE          # 벽 중심 y
+                    processed[b, i, 27] = wall_w / BOARD_SIZE          # 벽 너비
+                    processed[b, i, 28] = wall_h / BOARD_SIZE          # 벽 높이
+                    processed[b, i, 29] = wall_dir                     # 내돌→벽 방향
+                else:
+                    processed[b, i, 24:30] = 0.0  # 벽 없음
 
         # MuJoCo 스타일: Observation Normalization
         if training:
@@ -440,15 +507,25 @@ class BaseAgent(kym.Agent):
                 avoidance_offset = get_wall_avoidance_angle(my_pos, target_pos, batch_obstacles)
                 avoidance_offset = np.degrees(avoidance_offset)  # 라디안 → 도
 
-            # AI의 각도 조절 + 벽 회피
-            angle_offset = val_np[i, 0] * 30.0 + avoidance_offset
+            # AI의 각도 조절 + 벽 회피 (확장: ±60도)
+            angle_offset = val_np[i, 0] * 60.0 + avoidance_offset
             final_angle = ideal_angle + angle_offset
 
-            # 거리 기반 파워 자동 조절
+            # 파워 계산: 적→경계 거리 고려 (멀리 밀어내야 할수록 강하게)
             dist = np.sqrt(dx**2 + dy**2)
-            base_power = 800 + (dist / BOARD_SIZE) * 1200  # 가까우면 800, 멀면 2000
-            adjustment = val_np[i, 1] * 0.3  # AI는 ±30%만 미세 조정
-            power = np.clip(base_power * (1 + adjustment), 500, 2500)
+
+            # 적이 경계에서 얼마나 먼지 계산
+            enemy_to_edge = min(target_pos[0], BOARD_SIZE - target_pos[0],
+                                target_pos[1], BOARD_SIZE - target_pos[1])
+            # 적이 경계에서 멀수록 더 강하게 (최대 1.8배)
+            edge_factor = 1.0 + (enemy_to_edge / BOARD_SIZE) * 0.8
+
+            # 기본 파워 상향 + 경계 팩터 적용
+            base_power = (1000 + (dist / BOARD_SIZE) * 1000) * edge_factor
+            # 조정 범위 비대칭: 감소 -30%, 증가 +70% (강타 유도)
+            adj_val = val_np[i, 1]
+            adjustment = adj_val * 0.7 if adj_val > 0 else adj_val * 0.3
+            power = np.clip(base_power * (1 + adjustment), 600, 2800)
 
             actions.append({
                 "turn": my_turn, "index": stone_idx,
@@ -817,8 +894,9 @@ def train():
                 suicide_penalty = np.zeros(len(my_idx))
                 suicide_penalty[(s_r > 0) & (k_r == 0)] = -5.0
 
-                # === 벽 뒤 방어 보너스 ===
+                # === 벽 뒤 방어 보너스 & 벽 충돌 페널티 ===
                 wall_defense_bonus = np.zeros(len(my_idx))
+                wall_collision_penalty = np.zeros(len(my_idx))
                 obstacles = next_obs.get('obstacles', None)
                 for i, env_i in enumerate(my_idx):
                     my_stones = next_obs['black'][env_i]
@@ -842,7 +920,12 @@ def train():
                             if alive_count > 0:
                                 wall_defense_bonus[i] = (total_protection / alive_count) * 0.15
 
-                r = (k_r * 50.0) - (s_r * 5.0) + push_reward + suicide_penalty + wall_defense_bonus - 0.1
+                        # === 벽 충돌 페널티 ===
+                        # 내 돌이 벽에 부딪힌 경우 페널티
+                        my_collisions = calculate_wall_collision(my_stones, batch_obs)
+                        wall_collision_penalty[i] = -np.sum(my_collisions) * 2.0  # 충돌당 -2.0
+
+                r = (k_r * 50.0) - (s_r * 5.0) + push_reward + suicide_penalty + wall_defense_bonus + wall_collision_penalty - 0.1
 
                 done = np.logical_or(term, trunc)[my_idx]
                 win = (curr_opp[my_idx] == 0) & done
