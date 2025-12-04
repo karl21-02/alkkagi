@@ -6,14 +6,14 @@ import time
 
 # 각 모델에 맞는 에이전트 클래스 가져오기
 # kg: ppo.py (HybridActorCritic 구조)
-# dg: alkkagi.py (SniperNet 구조)
+# dg: dg_2025_12_04.py (SniperNet 구조)
 from ppo import YourBlackAgent as KGBlackAgent, YourWhiteAgent as KGWhiteAgent
-from alkkagi import YourBlackAgent as DGBlackAgent, YourWhiteAgent as DGWhiteAgent
+from dg_2025_12_04 import YourBlackAgent as DGBlackAgent, YourWhiteAgent as DGWhiteAgent
 
 # ==========================================
 # 대결 설정: 두 에이전트 파일 경로
 # ==========================================
-BLACK_MODEL = "my_alkkagi_agent_kg.pkl"  # 흑돌 (선공) - kg (ppo.py)
+BLACK_MODEL = "my_alkkagi_agent_gd.pkl"  # 흑돌 (선공) - kg (ppo.py)
 WHITE_MODEL = "my_alkkagi_agent_dg.pkl"  # 백돌 (후공) - dg (ggagi.py)
 
 

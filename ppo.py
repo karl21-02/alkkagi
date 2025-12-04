@@ -413,6 +413,49 @@ class BaseAgent(kym.Agent):
         self._obs_buffer = None
         self._mask_buffer = None
 
+    def _is_wall_blocking(self, my_pos: np.ndarray, target_pos: np.ndarray,
+                          box_center: np.ndarray, box_size: np.ndarray) -> float:
+        """
+        경로가 벽에 막히는지 체크 (Line Sampling)
+
+        원리:
+        - 시작점(my_pos)에서 끝점(target_pos)까지 직선 경로를 10등분
+        - 각 지점이 벽 영역 안에 있는지 체크
+        - 돌의 반지름(15)을 고려하여 벽 영역을 약간 확장
+
+        Args:
+            my_pos: 내 돌 위치 [x, y]
+            target_pos: 타겟(적) 위치 [x, y]
+            box_center: 벽 중심 [x, y]
+            box_size: 벽 크기 [width, height]
+
+        Returns:
+            1.0 if blocked, 0.0 if clear
+        """
+        stone_radius = 15.0
+
+        # 벽 영역 계산 (돌 반지름 고려)
+        half_w = box_size[0] / 2 + stone_radius
+        half_h = box_size[1] / 2 + stone_radius
+
+        x_min = box_center[0] - half_w
+        x_max = box_center[0] + half_w
+        y_min = box_center[1] - half_h
+        y_max = box_center[1] + half_h
+
+        # 경로 샘플링 (11 포인트: 0%, 10%, 20%, ..., 100%)
+        diff = target_pos - my_pos
+        for i in range(11):
+            t = i / 10.0
+            check_x = my_pos[0] + t * diff[0]
+            check_y = my_pos[1] + t * diff[1]
+
+            # AABB 충돌 체크
+            if x_min <= check_x <= x_max and y_min <= check_y <= y_max:
+                return 1.0  # 막힘
+
+        return 0.0  # 통과
+
     def _process_obs(self, obs: Dict, override_turn: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         관측값을 신경망 입력 형태로 변환
