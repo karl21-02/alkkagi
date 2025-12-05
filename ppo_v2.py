@@ -77,15 +77,15 @@ LR_START = 3e-4
 LR_END = 1e-5
 MAX_UPDATES = 10000
 
-# 엔트로피 스케줄링 (탐험 → 활용)
+# 엔트로피 스케줄링 (탐험 → 활용) - 개선: 더 천천히 감소
 ENTROPY_START = 0.05      # 초반: 높은 탐험
-ENTROPY_END = 0.005       # 후반: 낮은 탐험
-ENTROPY_DECAY_UPDATES = 5000  # 감소 기간
+ENTROPY_END = 0.01        # 후반: 최소 탐험 유지 (0.005 → 0.01)
+ENTROPY_DECAY_UPDATES = 8000  # 감소 기간 (5000 → 8000)
 
-# 시작 돌 랜덤 선택 (탐험 다양성)
+# 시작 돌 랜덤 선택 (탐험 다양성) - 개선: 더 오래 유지
 RANDOM_STONE_PROB_START = 0.3  # 초반: 30% 확률로 랜덤 돌 선택
-RANDOM_STONE_PROB_END = 0.0    # 후반: 0%
-RANDOM_STONE_DECAY = 3000      # 감소 기간
+RANDOM_STONE_PROB_END = 0.05   # 후반: 5% 유지 (0.0 → 0.05)
+RANDOM_STONE_DECAY = 7000      # 감소 기간 (3000 → 7000)
 
 # 게임 환경
 BOARD_SIZE = 600.0
@@ -93,11 +93,11 @@ POWER_MIN = 300.0
 POWER_MAX = 2500.0
 ANGLE_RANGE = 60.0  # ±60도 (기존 45도에서 확장)
 
-# Self-Play 설정
+# Self-Play 설정 - 개선: 다양성 확보
 SAVE_INTERVAL = 50
 SWAP_INTERVAL = 20
-MODEL_POOL_SIZE = 10  # 5 → 10으로 확대
-RULEBOT_PHASE = 300   # RuleBot 학습 기간
+MODEL_POOL_SIZE = 20   # 10 → 20 (더 많은 과거 버전 보관)
+RULEBOT_PHASE = 1000   # 300 → 1000 (기본기 더 오래 학습)
 
 SAVE_PATH = "my_alkkagi_agent_v2.pkl"
 HISTORY_DIR = "history_models_v2"
@@ -679,9 +679,14 @@ class OpponentManager:
         existing.sort(key=lambda x: int(x.split("_")[-1].replace(".pkl", "")))
         self.pool = existing[-MODEL_POOL_SIZE:]
 
-    def save_model(self, model, step: int):
+    def save_model(self, agent, step: int):
+        """에이전트 저장 (모델 + obs_rms + reward_rms 포함)"""
         path = os.path.join(self.save_dir, f"model_{step}.pkl")
-        torch.save(model.state_dict(), path)
+        torch.save({
+            'model_state_dict': agent.model.state_dict(),
+            'obs_rms': agent.obs_rms.state_dict(),
+            'reward_rms': agent.reward_rms.state_dict()
+        }, path)
         if path not in self.pool:
             self.pool.append(path)
         while len(self.pool) > MODEL_POOL_SIZE:
@@ -698,7 +703,16 @@ class OpponentManager:
         opponent = YourBlackAgent()
         opponent.my_turn = 1
         try:
-            opponent.model.load_state_dict(torch.load(opponent_path, map_location=DEVICE, weights_only=False))
+            checkpoint = torch.load(opponent_path, map_location=DEVICE, weights_only=False)
+            # 새 형식 (model_state_dict + obs_rms + reward_rms) 또는 이전 형식 (state_dict만) 지원
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                opponent.model.load_state_dict(checkpoint['model_state_dict'])
+                if 'obs_rms' in checkpoint:
+                    opponent.obs_rms.load_state_dict(checkpoint['obs_rms'])
+                if 'reward_rms' in checkpoint:
+                    opponent.reward_rms.load_state_dict(checkpoint['reward_rms'])
+            else:
+                opponent.model.load_state_dict(checkpoint)
             opponent.model.eval()
             version = opponent_path.split("_")[-1].replace(".pkl", "")
             self.current_opponent_name = f"Self-v{version}"
@@ -719,15 +733,15 @@ def make_env():
 
 def compute_reward(obs, next_obs, my_idx, term, trunc):
     """
-    개선된 보상 함수
+    개선된 보상 함수 v2
 
-    - 킬: +30 (기존 +50에서 조정)
-    - 데스: -20 (기존 -30에서 조정)
+    - 킬: +40 (킬 보상 상향)
+    - 데스: -15 (데스 페널티 완화)
     - 승리: +100
     - 패배: -50
     - 밀어내기: +0.03 * 거리
-    - 스텝: -0.05 (기존 -0.1에서 완화)
-    - 경계 접근 보너스: 적이 경계에 가까우면 추가 보상
+    - 스텝: -0.02 (스텝 페널티 완화)
+    - 경계 접근 보너스: 적이 100 이내면 추가 보상
     """
     batch_size = len(my_idx)
     rewards = np.zeros(batch_size, dtype=np.float32)
@@ -743,11 +757,11 @@ def compute_reward(obs, next_obs, my_idx, term, trunc):
         enemy_alive_before = np.sum(enemy_before[:, 2])
         enemy_alive_after = np.sum(enemy_after[:, 2])
 
-        # 킬/데스
+        # 킬/데스 - 개선: 킬 보상 상향, 데스 페널티 완화
         kills = enemy_alive_before - enemy_alive_after
         deaths = my_alive_before - my_alive_after
-        rewards[i] += kills * 30.0
-        rewards[i] -= deaths * 20.0
+        rewards[i] += kills * 40.0   # 30 → 40
+        rewards[i] -= deaths * 15.0  # 20 → 15
 
         # 밀어내기 보상
         for j in range(3):
@@ -771,8 +785,8 @@ def compute_reward(obs, next_obs, my_idx, term, trunc):
             elif my_alive_after == 0:
                 rewards[i] -= 50.0   # 패배
 
-        # 스텝 페널티 (완화)
-        rewards[i] -= 0.05
+        # 스텝 페널티 - 개선: 더 완화 (0.05 → 0.02)
+        rewards[i] -= 0.02
 
     return rewards
 
@@ -824,7 +838,7 @@ def train():
 
     op_manager = OpponentManager()
     if start_update == 1:
-        op_manager.save_model(agent.model, 0)
+        op_manager.save_model(agent, 0)  # agent 전체 전달 (obs_rms 포함)
 
     obs, _ = envs.reset()
 
@@ -850,7 +864,7 @@ def train():
         agent.update_schedules(update)
 
         if update % SAVE_INTERVAL == 0:
-            op_manager.save_model(agent.model, update)
+            op_manager.save_model(agent, update)
 
         if update % SWAP_INTERVAL == 0:
             opponent, opponent_name = op_manager.get_opponent(update)
@@ -863,7 +877,9 @@ def train():
             if len(my_idx) > 0:
                 obs_me = {k: v[my_idx] for k, v in obs.items()}
                 obs_np, stone_mask = agent._process_obs(obs_me, override_turn=0)
-                obs_np = agent._normalize_obs(obs_np, update=True)
+                # obs_rms 업데이트는 별도로, 정규화 시에는 update=False로 일관성 유지
+                agent.obs_rms.update(obs_np)
+                obs_np = agent._normalize_obs(obs_np, update=False)
 
                 stone_idx, action, log_p_stone, log_p_action = agent.get_action(
                     obs_np, stone_mask, deterministic=False
@@ -872,7 +888,8 @@ def train():
 
                 with torch.inference_mode():
                     obs_tensor = torch.tensor(obs_np, dtype=torch.float32).to(DEVICE)
-                    _, _, _, values = agent.model(obs_tensor, None)
+                    mask_tensor = torch.tensor(stone_mask, dtype=torch.float32).to(DEVICE)
+                    _, _, _, values = agent.model(obs_tensor, mask_tensor)
                 values_np = values.cpu().numpy().flatten()
 
             op_idx = np.where(turns == 1)[0]
@@ -887,7 +904,9 @@ def train():
                 else:
                     obs_np_op, mask_op = opponent._process_obs(obs_op, override_turn=1)
                     obs_np_op = opponent._normalize_obs(obs_np_op, update=False)
-                    si, ac, _, _ = opponent.get_action(obs_np_op, mask_op, deterministic=True)
+                    # 상대방도 10% 확률로 탐험 (다양한 대전 경험)
+                    op_deterministic = random.random() > 0.1
+                    si, ac, _, _ = opponent.get_action(obs_np_op, mask_op, deterministic=op_deterministic)
                     op_actions = opponent.decode_action(si, ac, obs_op, 1)
 
             action_list = [None] * NUM_ENVS
